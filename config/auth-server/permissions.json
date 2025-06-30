@@ -1,0 +1,36 @@
+// config/auth-server/permissions.json
+{
+  "roles": {
+    "protocol-adapter": [
+      "registration/*:*",
+      "credentials/*:*",
+      "tenant/*:*"
+    ],
+    "consumer": [
+      "telemetry/*:*",
+      "event/*:*",
+      "command_response/*:*"
+    ],
+    "application": [
+      "command/*:*"
+    ]
+  },
+  "users": {
+    "http-adapter@HONO": {
+      "mechanism": "PLAIN",
+      "password": "http-secret",
+      "authorities": ["protocol-adapter"]
+    },
+    "mqtt-adapter@HONO": {
+      "mechanism": "PLAIN", 
+      "password": "mqtt-secret",
+      "authorities": ["protocol-adapter"]
+    },
+    "consumer@HONO": {
+      "mechanism": "PLAIN",
+      "password": "consumer-secret", 
+      "authorities": ["consumer"]
+    }
+  }
+}
+

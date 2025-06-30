@@ -1,0 +1,483 @@
+# Module 3: Eclipse Hono Deployment Implementation Guide
+
+## Overview
+This module establishes Eclipse Hono as the secure IoT gateway platform for HONO-SOC. We'll deploy Hono using Docker containers with proper device registry and tenant management.
+
+## Prerequisites
+- Docker Engine 20.10+
+- Docker Compose 2.0+
+- Kubernetes cluster (optional, for production)
+- 8GB+ RAM for local development
+- Ports 1883, 5671, 5672, 8080, 8443, 9090, 15672 available
+
+## Architecture Components
+
+### Core Hono Services
+1. **Device Registry** - Manages device identities and credentials
+2. **HTTP Adapter** - Handles HTTP protocol communications
+3. **MQTT Adapter** - Handles MQTT protocol communications
+4. **AMQP Adapter** - Handles AMQP protocol communications
+5. **Auth Server** - Provides authentication services
+6. **Command Router** - Routes commands to devices
+
+### Supporting Services
+- **Apache Qpid Dispatch Router** - Message routing
+- **MongoDB** - Device registry persistence
+- **Apache Kafka** - Message streaming (optional)
+- **Grafana + Prometheus** - Monitoring (optional)
+
+## Implementation Steps
+
+### Step 1: Docker Compose Setup
+
+Create the main deployment configuration:
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Message Router - Using Apache Qpid Dispatch Router directly
+  dispatch-router:
+    image: quay.io/interconnectedcloud/qdrouterd:1.19.0
+    ports:
+      - "15671:5671"  # AMQPS
+      - "15672:5672"  # AMQP
+    volumes:
+      - ./config/dispatch:/etc/qpid-dispatch:ro
+    networks:
+      - hono-network
+
+  # MongoDB for Device Registry
+  mongodb:
+    image: mongo:6.0
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=hono
+      - MONGO_INITDB_ROOT_PASSWORD=secret
+      - MONGO_INITDB_DATABASE=hono
+    volumes:
+      - mongodb_data:/data/db
+      - ./config/mongodb:/docker-entrypoint-initdb.d:ro
+    networks:
+      - hono-network
+
+  # Device Registry Service
+  device-registry:
+    image: eclipse/hono-service-device-registry-mongodb:2.6.0
+    ports:
+      - "28080:8080"  # HTTP API
+      - "28443:8443"  # HTTPS API
+    environment:
+      - HONO_REGISTRY_AMQP_BIND_ADDRESS=0.0.0.0
+      - HONO_REGISTRY_HTTP_BIND_ADDRESS=0.0.0.0
+      - HONO_MONGODB_HOST=mongodb
+      - HONO_MONGODB_PORT=27017
+      - HONO_MONGODB_DB_NAME=hono
+      - HONO_MONGODB_USERNAME=hono
+      - HONO_MONGODB_PASSWORD=secret
+    depends_on:
+      - mongodb
+      - dispatch-router
+    volumes:
+      - ./config/device-registry:/opt/hono/config:ro
+      - ./certs:/opt/hono/certs:ro
+    networks:
+      - hono-network
+
+  # Auth Server
+  auth-server:
+    image: eclipse/hono-service-auth:2.6.0
+    ports:
+      - "25671:5671"
+      - "25672:5672"
+    environment:
+      - HONO_AUTH_AMQP_BIND_ADDRESS=0.0.0.0
+      - HONO_AUTH_SVC_PERMISSIONS_PATH=/opt/hono/config/permissions.json
+    volumes:
+      - ./config/auth-server:/opt/hono/config:ro
+      - ./certs:/opt/hono/certs:ro
+    depends_on:
+      - dispatch-router
+    networks:
+      - hono-network
+
+  # HTTP Protocol Adapter
+  adapter-http:
+    image: eclipse/hono-adapter-http:2.6.0
+    ports:
+      - "18080:8080"  # HTTP
+      - "18443:8443"  # HTTPS
+    environment:
+      - HONO_HTTP_BIND_ADDRESS=0.0.0.0
+      - HONO_HTTP_REGISTRY_HOST=device-registry
+      - HONO_HTTP_REGISTRY_PORT=5672
+      - HONO_HTTP_MESSAGING_HOST=dispatch-router
+      - HONO_HTTP_MESSAGING_PORT=5672
+      - HONO_HTTP_TENANT_API_HOST=device-registry
+      - HONO_HTTP_TENANT_API_PORT=5672
+    depends_on:
+      - device-registry
+      - auth-server
+      - dispatch-router
+    volumes:
+      - ./config/http-adapter:/opt/hono/config:ro
+      - ./certs:/opt/hono/certs:ro
+    networks:
+      - hono-network
+
+  # Command Router Service (required in Hono 2.6.0)
+  command-router:
+    image: eclipse/hono-service-command-router:2.6.0
+    ports:
+      - "26671:5671"
+      - "26672:5672"
+    environment:
+      - HONO_COMMANDROUTER_AMQP_BIND_ADDRESS=0.0.0.0
+      - HONO_COMMANDROUTER_MESSAGING_HOST=dispatch-router
+      - HONO_COMMANDROUTER_MESSAGING_PORT=5672
+    depends_on:
+      - dispatch-router
+      - auth-server
+    volumes:
+      - ./config/command-router:/opt/hono/config:ro
+      - ./certs:/opt/hono/certs:ro
+    networks:
+      - hono-network
+
+  # MQTT Protocol Adapter
+  adapter-mqtt:
+    image: eclipse/hono-adapter-mqtt:2.6.0
+    ports:
+      - "1883:1883"   # MQTT
+      - "8883:8883"   # MQTTS
+    environment:
+      - HONO_MQTT_BIND_ADDRESS=0.0.0.0
+      - HONO_MQTT_REGISTRY_HOST=device-registry
+      - HONO_MQTT_REGISTRY_PORT=5672
+      - HONO_MQTT_MESSAGING_HOST=dispatch-router
+      - HONO_MQTT_MESSAGING_PORT=5672
+      - HONO_MQTT_TENANT_API_HOST=device-registry
+      - HONO_MQTT_TENANT_API_PORT=5672
+    depends_on:
+      - device-registry
+      - auth-server
+      - dispatch-router
+    volumes:
+      - ./config/mqtt-adapter:/opt/hono/config:ro
+      - ./certs:/opt/hono/certs:ro
+    networks:
+      - hono-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  hono-network:
+    driver: bridge
+```
+
+### Step 2: Configuration Files
+
+Create the configuration directory structure:
+
+```bash
+mkdir -p config/{dispatch,device-registry,auth-server,http-adapter,mqtt-adapter,command-router,mongodb}
+mkdir -p certs
+```
+
+#### Device Registry Configuration
+```yaml
+# config/device-registry/application.yml
+server:
+  port: 8080
+
+hono:
+  app:
+    maxInstances: 1
+  registry:
+    amqp:
+      bindAddress: "0.0.0.0"
+      port: 5672
+    http:
+      bindAddress: "0.0.0.0"
+      port: 8080
+    svc:
+      mongodb:
+        host: "mongodb"
+        port: 27017
+        dbName: "hono"
+        username: "hono"
+        password: "secret"
+  tenant:
+    service:
+      tenants:
+        - tenant-id: "hono-soc-tenant"
+          enabled: true
+          defaults:
+            ttl: 3600
+          adapters:
+            - type: "http"
+              enabled: true
+              device-authentication-required: true
+            - type: "mqtt"
+              enabled: true
+              device-authentication-required: true
+```
+
+#### Auth Server Configuration
+```json
+// config/auth-server/permissions.json
+{
+  "roles": {
+    "protocol-adapter": [
+      "registration/*:*",
+      "credentials/*:*",
+      "tenant/*:*"
+    ],
+    "consumer": [
+      "telemetry/*:*",
+      "event/*:*",
+      "command_response/*:*"
+    ],
+    "application": [
+      "command/*:*"
+    ]
+  },
+  "users": {
+    "http-adapter@HONO": {
+      "mechanism": "PLAIN",
+      "password": "http-secret",
+      "authorities": ["protocol-adapter"]
+    },
+    "mqtt-adapter@HONO": {
+      "mechanism": "PLAIN", 
+      "password": "mqtt-secret",
+      "authorities": ["protocol-adapter"]
+    },
+    "consumer@HONO": {
+      "mechanism": "PLAIN",
+      "password": "consumer-secret", 
+      "authorities": ["consumer"]
+    }
+  }
+}
+```
+
+#### Dispatch Router Configuration
+```
+# config/dispatch/qdrouterd.conf
+router {
+    mode: standalone
+    id: Hono.Example.Router
+    workerThreads: 4
+}
+
+listener {
+    host: 0.0.0.0
+    port: 5672
+    authenticatePeer: no
+    saslMechanisms: ANONYMOUS
+}
+
+listener {
+    host: 0.0.0.0
+    port: 5671
+    authenticatePeer: yes
+    requireSsl: yes
+    sslProfile: external
+    saslMechanisms: PLAIN
+}
+
+sslProfile {
+    name: external
+    certFile: /opt/hono/certs/cert.pem
+    keyFile: /opt/hono/certs/key.pem
+    caCertFile: /opt/hono/certs/ca-cert.pem
+}
+
+address {
+    prefix: telemetry/
+    distribution: balanced
+}
+
+address {
+    prefix: event/
+    distribution: balanced
+}
+
+address {
+    prefix: command/
+    distribution: balanced
+}
+```
+
+### Step 3: Certificate Generation
+
+Create a script to generate development certificates:
+
+```bash
+#!/bin/bash
+# scripts/generate-certs.sh
+
+CERT_DIR="./certs"
+mkdir -p $CERT_DIR
+
+# Generate CA key and certificate
+openssl genrsa -out $CERT_DIR/ca-key.pem 4096
+openssl req -new -x509 -key $CERT_DIR/ca-key.pem -out $CERT_DIR/ca-cert.pem -days 365 \
+    -subj "/C=US/ST=CA/L=San Francisco/O=HONO-SOC/CN=HONO-SOC-CA"
+
+# Generate server key and certificate
+openssl genrsa -out $CERT_DIR/key.pem 4096
+openssl req -new -key $CERT_DIR/key.pem -out $CERT_DIR/cert.csr \
+    -subj "/C=US/ST=CA/L=San Francisco/O=HONO-SOC/CN=hono-server"
+openssl x509 -req -in $CERT_DIR/cert.csr -CA $CERT_DIR/ca-cert.pem -CAkey $CERT_DIR/ca-key.pem \
+    -CAcreateserial -out $CERT_DIR/cert.pem -days 365
+
+# Generate client certificates for testing
+openssl genrsa -out $CERT_DIR/client-key.pem 4096
+openssl req -new -key $CERT_DIR/client-key.pem -out $CERT_DIR/client.csr \
+    -subj "/C=US/ST=CA/L=San Francisco/O=HONO-SOC/CN=test-client"
+openssl x509 -req -in $CERT_DIR/client.csr -CA $CERT_DIR/ca-cert.pem -CAkey $CERT_DIR/ca-key.pem \
+    -CAcreateserial -out $CERT_DIR/client-cert.pem -days 365
+
+# Clean up CSR files
+rm $CERT_DIR/*.csr
+
+echo "Certificates generated in $CERT_DIR"
+```
+
+### Step 4: Deployment Scripts
+
+```bash
+#!/bin/bash
+# scripts/deploy.sh
+
+echo "Starting HONO-SOC Module 3 deployment..."
+
+# Generate certificates if they don't exist
+if [ ! -f "./certs/ca-cert.pem" ]; then
+    echo "Generating certificates..."
+    ./scripts/generate-certs.sh
+fi
+
+# Start the stack
+echo "Starting Hono services..."
+docker-compose up -d
+
+# Wait for services to be ready
+echo "Waiting for services to start..."
+sleep 30
+
+# Health check
+echo "Performing health checks..."
+curl -f http://localhost:28080/health || echo "Device Registry health check failed"
+curl -f http://localhost:18080/health || echo "HTTP Adapter health check failed"
+
+echo "Deployment complete!"
+echo "Device Registry: http://localhost:28080"
+echo "HTTP Adapter: http://localhost:18080"
+echo "MQTT Adapter: mqtt://localhost:1883"
+```
+
+### Step 5: Device Registration Script
+
+```bash
+#!/bin/bash
+# scripts/register-device.sh
+
+TENANT_ID="hono-soc-tenant"
+DEVICE_ID="sovd-server-001"
+DEVICE_PASSWORD="sovd-secret"
+
+echo "Registering device $DEVICE_ID in tenant $TENANT_ID..."
+
+# Register device
+curl -X POST http://localhost:28080/v1/devices/$TENANT_ID \
+  -H "Content-Type: application/json" \
+  -d "{\"device-id\": \"$DEVICE_ID\", \"enabled\": true}"
+
+# Set device credentials
+curl -X PUT http://localhost:28080/v1/credentials/$TENANT_ID/$DEVICE_ID \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"type\": \"hashed-password\",
+    \"auth-id\": \"$DEVICE_ID\",
+    \"secrets\": [{
+      \"pwd-plain\": \"$DEVICE_PASSWORD\"
+    }]
+  }"
+
+echo "Device registered successfully!"
+```
+
+### Step 6: Testing and Validation
+
+```bash
+#!/bin/bash
+# scripts/test-deployment.sh
+
+echo "Testing HONO-SOC Module 3 deployment..."
+
+# Test 1: Device Registry API
+echo "Testing Device Registry API..."
+curl -f http://localhost:28080/v1/tenants/hono-soc-tenant
+
+# Test 2: HTTP Adapter
+echo "Testing HTTP Adapter..."
+curl -f http://localhost:18080/health
+
+# Test 3: MQTT Adapter connectivity
+echo "Testing MQTT Adapter..."
+mosquitto_pub -h localhost -p 1883 -t "telemetry/hono-soc-tenant/sovd-server-001" \
+  -u "sovd-server-001@hono-soc-tenant" -P "sovd-secret" \
+  -m '{"temp": 23.5, "humidity": 60}' || echo "MQTT test failed"
+
+echo "All tests completed!"
+```
+
+## Verification Checklist
+
+- [x] All containers start successfully
+- [ ] Device Registry responds on port 28080
+- [ ] HTTP Adapter responds on port 18080
+- [ ] MQTT Adapter accepts connections on port 1883
+- [ ] MongoDB is accessible and initialized
+- [ ] Test tenant "hono-soc-tenant" exists
+- [ ] Test device can be registered
+- [ ] SSL certificates are properly configured
+- [ ] Health endpoints return 200 OK
+
+## Next Steps
+
+After successful deployment:
+1. Configure additional tenants as needed
+2. Set up monitoring with Prometheus/Grafana
+3. Implement backup procedures for MongoDB
+4. Prepare for Module 5 (Custom HTTP Proxy Adapter) integration
+5. Document API endpoints and authentication methods
+
+## Troubleshooting
+
+### Common Issues
+- **Port conflicts**: Ensure all ports are available
+- **Certificate errors**: Regenerate certificates if expired
+- **MongoDB connection**: Check MongoDB credentials and network connectivity
+- **Memory issues**: Increase Docker memory limits for development
+
+### Useful Commands
+```bash
+# View logs
+docker-compose logs -f [service-name]
+
+# Restart specific service
+docker-compose restart [service-name]
+
+# Clean restart
+docker-compose down && docker-compose up -d
+
+# Check service health
+docker-compose ps
+```

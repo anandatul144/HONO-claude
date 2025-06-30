@@ -1,0 +1,35 @@
+# config/device-registry/application.yml
+server:
+  port: 8080
+
+hono:
+  app:
+    maxInstances: 1
+  registry:
+    amqp:
+      bindAddress: "0.0.0.0"
+      port: 5672
+    http:
+      bindAddress: "0.0.0.0"
+      port: 8080
+    svc:
+      mongodb:
+        host: "mongodb"
+        port: 27017
+        dbName: "hono"
+        username: "hono"
+        password: "secret"
+  tenant:
+    service:
+      tenants:
+        - tenant-id: "hono-soc-tenant"
+          enabled: true
+          defaults:
+            ttl: 3600
+          adapters:
+            - type: "http"
+              enabled: true
+              device-authentication-required: true
+            - type: "mqtt"
+              enabled: true
+              device-authentication-required: true
