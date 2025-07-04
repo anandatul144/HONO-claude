@@ -1,0 +1,50 @@
+{
+  "roles": {
+    "protocol-adapter": [
+      "registration/*:*",
+      "credentials/*:*",
+      "tenant/*:*",
+      "command_response/*:*"
+    ],
+    "consumer": [
+      "telemetry/*:*",
+      "event/*:*",
+      "command_response/*:*"
+    ],
+    "application": [
+      "command/*:*"
+    ]
+  },
+  "users": {
+    "http-adapter@HONO": {
+      "mechanism": "PLAIN",
+      "password": "http-secret",
+      "authorities": ["protocol-adapter"]
+    },
+    "mqtt-adapter@HONO": {
+      "mechanism": "PLAIN", 
+      "password": "mqtt-secret",
+      "authorities": ["protocol-adapter"]
+    },
+    "registry-adapter@HONO": {
+      "mechanism": "PLAIN",
+      "password": "registry-secret", 
+      "authorities": ["protocol-adapter"]
+    },
+    "command-router@HONO": {
+      "mechanism": "PLAIN",
+      "password": "command-secret", 
+      "authorities": ["protocol-adapter"]
+    },
+    "consumer@HONO": {
+      "mechanism": "PLAIN",
+      "password": "consumer-secret", 
+      "authorities": ["consumer"]
+    },
+    "application@HONO": {
+      "mechanism": "PLAIN",
+      "password": "app-secret", 
+      "authorities": ["application"]
+    }
+  }
+}
