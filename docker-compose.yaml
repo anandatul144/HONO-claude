@@ -1,19 +1,27 @@
+version: '3.8'
 
 services:
-  # Message Router - Using Apache Qpid Dispatch Router directly
+  # Message Router
   dispatch-router:
-    image: quay.io/interconnectedcloud/qdrouterd:latest
+    image: quay.io/interconnectedcloud/qdrouterd
     ports:
       - "15671:5671"  # AMQPS
       - "15672:5672"  # AMQP
     volumes:
-      - ./config/dispatch:/etc/qpid-dispatch:ro
+      - ./config/dispatch/qdrouterd.conf:/etc/qpid-dispatch/qdrouterd.conf:ro
+    command: ["/sbin/qdrouterd", "-c", "/etc/qpid-dispatch/qdrouterd.conf"]
     networks:
       - hono-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   # MongoDB for Device Registry
   mongodb:
-    image: docker.io/mongo:6.0.24
+    image: docker.io/mongo:6.0
     ports:
       - "27017:27017"
     environment:
@@ -22,34 +30,14 @@ services:
       - MONGO_INITDB_DATABASE=hono
     volumes:
       - mongodb_data:/data/db
-      - ./config/mongodb:/docker-entrypoint-initdb.d:ro
     networks:
       - hono-network
-
-  # Device Registry Service
-  device-registry:
-    image: docker.io/eclipse/hono-service-device-registry-mongodb:2.6.0
-    ports:
-      - "28080:8080"  # HTTP API
-      - "28443:8443"  # HTTPS API
-    environment:
-      - HONO_REGISTRY_AMQP_BIND_ADDRESS=0.0.0.0
-      - HONO_REGISTRY_HTTP_BIND_ADDRESS=0.0.0.0
-      - HONO_MONGODB_HOST=mongodb
-      - HONO_MONGODB_PORT=27017
-      - HONO_MONGODB_DB_NAME=hono
-      - HONO_MONGODB_USERNAME=hono
-      - HONO_MONGODB_PASSWORD=secret
-      # Replace the MongoDB env vars with:
-      - HONO_MONGODB_CONNECTION_STRING=mongodb://hono:secret@mongodb:27017/hono
-    depends_on:
-      - mongodb
-      - dispatch-router
-    volumes:
-      - ./config/device-registry/application.yaml:/opt/hono/config/application.yaml:ro
-      - ./certs:/opt/hono/certs:ro
-    networks:
-      - hono-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   # Auth Server
   auth-server:
@@ -58,17 +46,103 @@ services:
       - "25671:5671"
       - "25672:5672"
     environment:
-    # Add to auth-server service environment:
-      - HONO_AUTH_SVC_PERMISSIONS_PATH=/opt/hono/config/permissions.json
+      # Basic service configuration
       - HONO_AUTH_AMQP_BIND_ADDRESS=0.0.0.0
-      #- HONO_AUTH_MESSAGING_HOST=dispatch-router
+      - HONO_AUTH_AMQP_PORT=5672
+      - HONO_AUTH_AMQP_INSECURE_PORT_ENABLED=true
+      - HONO_AUTH_AMQP_INSECURE_PORT_BIND_ADDRESS=0.0.0.0
+      - HONO_AUTH_SVC_PERMISSIONSPATH=/config/auth_permissions.json
+      #- HONO_AUTH_SVC_PERMISSIONS_PATH=/etc/hono/permissions.json
+
+      # Signing key configuration
+      - HONO_AUTH_SVC_SIGNING_TOKEN_TTL=3600
+      - HONO_AUTH_SVC_SIGNING_KEY_PATH=/etc/certs/key.pem
     volumes:
-      - ./config/auth-server/permissions:/opt/hono/config/permissions:ro
-      - ./certs:/opt/hono/certs:ro
+      - ./auth_permissions.json:/config/auth_permissions.json:ro
+      - ./certs/key.pem:/etc/certs/key.pem:ro
     depends_on:
       - dispatch-router
+      #dispatch-router:
+        #condition: service_healthy
     networks:
       - hono-network
+    restart: unless-stopped
+
+  # Device Registry Service
+  device-registry:
+    image: docker.io/eclipse/hono-service-device-registry-mongodb:2.6.0
+    ports:
+      - "28080:8080"  # HTTP API
+      - "28443:8443"  # HTTPS API
+      - "25673:5672"  # AMQP
+    environment:
+      # Basic service configuration
+      - HONO_REGISTRY_AMQP_BIND_ADDRESS=0.0.0.0
+      - HONO_REGISTRY_AMQP_PORT=5672
+      - HONO_REGISTRY_AMQP_INSECURE_PORT_ENABLED=true
+      - HONO_REGISTRY_AMQP_INSECURE_PORT_BIND_ADDRESS=0.0.0.0
+      
+      # HTTP configuration
+      - HONO_REGISTRY_HTTP_BIND_ADDRESS=0.0.0.0
+      - HONO_REGISTRY_HTTP_PORT=8080
+      - HONO_REGISTRY_HTTP_INSECURE_PORT_ENABLED=true
+      - HONO_REGISTRY_HTTP_INSECURE_PORT_BIND_ADDRESS=0.0.0.0
+      
+      # MongoDB configuration (correct format for 2.6.0)
+      - HONO_MONGODB_CONNECTION_STRING=mongodb://hono:secret@mongodb:27017/hono
+      
+      # Auth server connection
+      - HONO_REGISTRY_AUTH_HOST=auth-server
+      - HONO_REGISTRY_AUTH_PORT=5672
+      - HONO_REGISTRY_AUTH_USERNAME=registry-adapter@HONO
+      - HONO_REGISTRY_AUTH_PASSWORD=registry-secret
+      
+      # Default tenant configuration
+      - HONO_REGISTRY_SVC_TENANT_TTL=3600
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      auth-server:
+        condition: service_started
+      dispatch-router:
+        condition: service_healthy
+    networks:
+      - hono-network
+    restart: unless-stopped
+
+  # Command Router Service
+  command-router:
+    image: docker.io/eclipse/hono-service-command-router:2.6.0
+    ports:
+      - "26671:5671"
+      - "26672:5672"
+    environment:
+      # Basic service configuration
+      - HONO_COMMANDROUTER_AMQP_BIND_ADDRESS=0.0.0.0
+      - HONO_COMMANDROUTER_AMQP_PORT=5672
+      - HONO_COMMANDROUTER_AMQP_INSECURE_PORT_ENABLED=true
+      - HONO_COMMANDROUTER_AMQP_INSECURE_PORT_BIND_ADDRESS=0.0.0.0
+      
+      # Messaging configuration (AMQP)
+      - HONO_MESSAGING_TYPE=amqp
+      - HONO_MESSAGING_HOST=dispatch-router
+      - HONO_MESSAGING_PORT=5672
+      - HONO_MESSAGING_USERNAME=command-router@HONO
+      - HONO_MESSAGING_PASSWORD=command-secret
+      
+      # Auth server connection
+      - HONO_COMMANDROUTER_AUTH_HOST=auth-server
+      - HONO_COMMANDROUTER_AUTH_PORT=5672
+      - HONO_COMMANDROUTER_AUTH_USERNAME=command-router@HONO
+      - HONO_COMMANDROUTER_AUTH_PASSWORD=command-secret
+    depends_on:
+      dispatch-router:
+        condition: service_healthy
+      auth-server:
+        condition: service_started
+    networks:
+      - hono-network
+    restart: unless-stopped
 
   # HTTP Protocol Adapter
   adapter-http:
@@ -77,51 +151,48 @@ services:
       - "18080:8080"  # HTTP
       - "18443:8443"  # HTTPS
     environment:
+      # Basic service configuration
       - HONO_HTTP_BIND_ADDRESS=0.0.0.0
+      - HONO_HTTP_PORT=8080
+      - HONO_HTTP_INSECURE_PORT_ENABLED=true
+      - HONO_HTTP_INSECURE_PORT_BIND_ADDRESS=0.0.0.0
+      
+      # Messaging configuration (AMQP)
+      - HONO_MESSAGING_TYPE=amqp
+      - HONO_MESSAGING_HOST=dispatch-router
+      - HONO_MESSAGING_PORT=5672
+      - HONO_MESSAGING_USERNAME=http-adapter@HONO
+      - HONO_MESSAGING_PASSWORD=http-secret
+      
+      # Device registry connection
       - HONO_HTTP_REGISTRY_HOST=device-registry
       - HONO_HTTP_REGISTRY_PORT=5672
-      - HONO_HTTP_MESSAGING_HOST=dispatch-router
-      - HONO_HTTP_MESSAGING_PORT=5672
-      - HONO_HTTP_TENANT_API_HOST=device-registry
-      - HONO_HTTP_TENANT_API_PORT=5672
-      - HONO_MESSAGING_TYPE=amqp
-      - HONO_MESSAGING_HOST=dispatch-router
-      - HONO_MESSAGING_PORT=5672
-      - HONO_MESSAGING_USERNAME=consumer@HONO
-      - HONO_MESSAGING_PASSWORD=consumer-secret
+      - HONO_HTTP_REGISTRY_USERNAME=http-adapter@HONO
+      - HONO_HTTP_REGISTRY_PASSWORD=http-secret
+      
+      # Auth server connection
+      - HONO_HTTP_AUTH_HOST=auth-server
+      - HONO_HTTP_AUTH_PORT=5672
+      - HONO_HTTP_AUTH_USERNAME=http-adapter@HONO
+      - HONO_HTTP_AUTH_PASSWORD=http-secret
+      
+      # Command router connection
+      - HONO_HTTP_COMMAND_HOST=command-router
+      - HONO_HTTP_COMMAND_PORT=5672
+      - HONO_HTTP_COMMAND_USERNAME=http-adapter@HONO
+      - HONO_HTTP_COMMAND_PASSWORD=http-secret
     depends_on:
-      - device-registry
-      - auth-server
-      - dispatch-router
-    volumes:
-      - ./config/http-adapter:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
+      device-registry:
+        condition: service_started
+      command-router:
+        condition: service_started
+      auth-server:
+        condition: service_started
+      dispatch-router:
+        condition: service_healthy
     networks:
       - hono-network
-
-  # Command Router Service (required in Hono 2.6.0)
-  command-router:
-    image: docker.io/eclipse/hono-service-command-router:2.6.0
-    ports:
-      - "26671:5671"
-      - "26672:5672"
-    environment:
-      - HONO_COMMANDROUTER_AMQP_BIND_ADDRESS=0.0.0.0
-      - HONO_COMMANDROUTER_MESSAGING_HOST=dispatch-router
-      - HONO_COMMANDROUTER_MESSAGING_PORT=5672
-      - HONO_MESSAGING_TYPE=amqp
-      - HONO_MESSAGING_HOST=dispatch-router
-      - HONO_MESSAGING_PORT=5672
-      - HONO_MESSAGING_USERNAME=consumer@HONO
-      - HONO_MESSAGING_PASSWORD=consumer-secret
-    depends_on:
-      - dispatch-router
-      - auth-server
-    volumes:
-      - ./config/command-router:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
-    networks:
-      - hono-network
+    restart: unless-stopped
 
   # MQTT Protocol Adapter
   adapter-mqtt:
@@ -130,28 +201,48 @@ services:
       - "1883:1883"   # MQTT
       - "8883:8883"   # MQTTS
     environment:
+      # Basic service configuration
       - HONO_MQTT_BIND_ADDRESS=0.0.0.0
-      - HONO_MQTT_REGISTRY_HOST=device-registry
-      - HONO_MQTT_REGISTRY_PORT=5672
-      - HONO_MQTT_MESSAGING_HOST=dispatch-router
-      - HONO_MQTT_MESSAGING_PORT=5672
-      - HONO_MQTT_TENANT_API_HOST=device-registry
-      - HONO_MQTT_TENANT_API_PORT=5672
-      # Add to command-router, http-adapter, mqtt-adapter:
+      - HONO_MQTT_PORT=1883
+      - HONO_MQTT_INSECURE_PORT_ENABLED=true
+      - HONO_MQTT_INSECURE_PORT_BIND_ADDRESS=0.0.0.0
+      
+      # Messaging configuration (AMQP)
       - HONO_MESSAGING_TYPE=amqp
       - HONO_MESSAGING_HOST=dispatch-router
       - HONO_MESSAGING_PORT=5672
-      - HONO_MESSAGING_USERNAME=consumer@HONO
-      - HONO_MESSAGING_PASSWORD=consumer-secret
+      - HONO_MESSAGING_USERNAME=mqtt-adapter@HONO
+      - HONO_MESSAGING_PASSWORD=mqtt-secret
+      
+      # Device registry connection
+      - HONO_MQTT_REGISTRY_HOST=device-registry
+      - HONO_MQTT_REGISTRY_PORT=5672
+      - HONO_MQTT_REGISTRY_USERNAME=mqtt-adapter@HONO
+      - HONO_MQTT_REGISTRY_PASSWORD=mqtt-secret
+      
+      # Auth server connection
+      - HONO_MQTT_AUTH_HOST=auth-server
+      - HONO_MQTT_AUTH_PORT=5672
+      - HONO_MQTT_AUTH_USERNAME=mqtt-adapter@HONO
+      - HONO_MQTT_AUTH_PASSWORD=mqtt-secret
+      
+      # Command router connection
+      - HONO_MQTT_COMMAND_HOST=command-router
+      - HONO_MQTT_COMMAND_PORT=5672
+      - HONO_MQTT_COMMAND_USERNAME=mqtt-adapter@HONO
+      - HONO_MQTT_COMMAND_PASSWORD=mqtt-secret
     depends_on:
-      - device-registry
-      - auth-server
-      - dispatch-router
-    volumes:
-      - ./config/mqtt-adapter:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
+      device-registry:
+        condition: service_started
+      command-router:
+        condition: service_started
+      auth-server:
+        condition: service_started
+      dispatch-router:
+        condition: service_healthy
     networks:
       - hono-network
+    restart: unless-stopped
 
 volumes:
   mongodb_data:
