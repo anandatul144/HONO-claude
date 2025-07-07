@@ -1,483 +1,394 @@
-# Module 3: Eclipse Hono Deployment Implementation Guide
+# HONO IDS SOC Docker Compose Configuration
+# This configuration implements a minimal HONO 2.6 stack for bridging SOVD Client and Server
+# Architecture: SOVD Server (Device) <-> HONO HTTP Adapter <-> SOVD Client
+# Security: Insecure mode for development (no authentication required)
 
-## Overview
-This module establishes Eclipse Hono as the secure IoT gateway platform for HONO-SOC. We'll deploy Hono using Docker containers with proper device registry and tenant management.
-
-## Prerequisites
-- Docker Engine 20.10+
-- Docker Compose 2.0+
-- Kubernetes cluster (optional, for production)
-- 8GB+ RAM for local development
-- Ports 1883, 5671, 5672, 8080, 8443, 9090, 15672 available
-
-## Architecture Components
-
-### Core Hono Services
-1. **Device Registry** - Manages device identities and credentials
-2. **HTTP Adapter** - Handles HTTP protocol communications
-3. **MQTT Adapter** - Handles MQTT protocol communications
-4. **AMQP Adapter** - Handles AMQP protocol communications
-5. **Auth Server** - Provides authentication services
-6. **Command Router** - Routes commands to devices
-
-### Supporting Services
-- **Apache Qpid Dispatch Router** - Message routing
-- **MongoDB** - Device registry persistence
-- **Apache Kafka** - Message streaming (optional)
-- **Grafana + Prometheus** - Monitoring (optional)
-
-## Implementation Steps
-
-### Step 1: Docker Compose Setup
-
-Create the main deployment configuration:
-
-```yaml
-# docker-compose.yml
 version: '3.8'
 
 services:
-  # Message Router - Using Apache Qpid Dispatch Router directly
-  dispatch-router:
-    image: quay.io/interconnectedcloud/qdrouterd:1.19.0
+  # =============================================================================
+  # HONO Core Services - Minimal Stack
+  # =============================================================================
+  
+  # Device Registry Service
+  # Manages device registration and metadata
+  # Exposes HTTP API for device management and registration UI
+  hono-device-registry:
+    image: eclipse/hono-service-device-registry:2.6.0
+    container_name: hono-device-registry
     ports:
-      - "15671:5671"  # AMQPS
-      - "15672:5672"  # AMQP
+      - "28080:8080"  # HTTP Management API
+      - "28443:8443"  # HTTPS Management API (unused in insecure mode)
+    environment:
+      # Service configuration
+      HONO_REGISTRY_SVC_BIND_ADDRESS: "0.0.0.0"
+      HONO_REGISTRY_SVC_INSECURE_PORT: "5671"
+      HONO_REGISTRY_SVC_INSECURE_PORT_ENABLED: "true"
+      
+      # HTTP endpoint configuration for device registration
+      HONO_REGISTRY_HTTP_BIND_ADDRESS: "0.0.0.0"
+      HONO_REGISTRY_HTTP_PORT: "8080"
+      HONO_REGISTRY_HTTP_INSECURE_PORT_ENABLED: "true"
+      
+      # Disable authentication for development
+      HONO_REGISTRY_SVC_AUTH_VALIDATION_SHARED_SECRET: "dummy-secret"
+      HONO_REGISTRY_CREDENTIALS_SVC_CREDENTIALS_TTL: "1h"
+      
+      # Enable device auto-provisioning
+      HONO_REGISTRY_SVC_RECEIVER_LINK_CREDIT: "100"
+      
+      # Logging configuration
+      HONO_LOG_LEVEL: "INFO"
+      
     volumes:
-      - ./config/dispatch:/etc/qpid-dispatch:ro
+      - hono-device-registry-data:/var/lib/hono/device-registry
     networks:
       - hono-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # MongoDB for Device Registry
+  # HTTP Protocol Adapter
+  # Handles HTTP communication between SOVD devices and clients
+  # Enables RESTful API for device command and control
+  hono-adapter-http:
+    image: eclipse/hono-adapter-http:2.6.0
+    container_name: hono-adapter-http
+    depends_on:
+      - hono-device-registry
+      - kafka
+    ports:
+      - "8080:8080"   # HTTP port for device communication
+      - "8443:8443"   # HTTPS port (unused in insecure mode)
+    environment:
+      # HTTP adapter configuration
+      HONO_HTTP_BIND_ADDRESS: "0.0.0.0"
+      HONO_HTTP_PORT: "8080"
+      HONO_HTTP_INSECURE_PORT_ENABLED: "true"
+      
+      # Disable authentication for development
+      HONO_HTTP_AUTHENTICATION_REQUIRED: "false"
+      HONO_HTTP_TENANT_IDLE_TIMEOUT: "0s"
+      
+      # Device registry connection
+      HONO_REGISTRY_HOST: "hono-device-registry"
+      HONO_REGISTRY_PORT: "5671"
+      HONO_REGISTRY_USERNAME: "consumer@HONO"
+      HONO_REGISTRY_PASSWORD: "verysecret"
+      
+      # Kafka message broker connection
+      HONO_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      HONO_KAFKA_PRODUCER_CONFIG: "acks=1,retries=3,batch.size=16384"
+      HONO_KAFKA_CONSUMER_CONFIG: "enable.auto.commit=true,auto.commit.interval.ms=1000"
+      
+      # Message routing configuration
+      HONO_MESSAGING_HOST: "kafka"
+      HONO_MESSAGING_PORT: "29092"
+      HONO_MESSAGING_TYPE: "kafka"
+      
+      # Command and control via Kafka
+      HONO_COMMAND_HOST: "kafka"
+      HONO_COMMAND_PORT: "29092"
+      HONO_COMMAND_TYPE: "kafka"
+      
+      # Logging
+      HONO_LOG_LEVEL: "INFO"
+      
+    networks:
+      - hono-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Apache Kafka Message Broker
+  # Message routing between HONO components and SOVD clients
+  # Handles event streaming and message brokering for IDS SOC
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: hono-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"   # Kafka broker port
+      - "9093:9093"   # External listener port
+    environment:
+      # Kafka broker configuration
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      
+      # Listener configuration for both internal and external access
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:29092,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      
+      # Topic configuration
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      
+      # Performance and retention settings
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_RETENTION_BYTES: 1073741824  # 1GB
+      
+      # JVM heap settings
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+      
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - hono-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Apache Zookeeper
+  # Required for Kafka cluster coordination
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: hono-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 10
+      ZOOKEEPER_SYNC_LIMIT: 5
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - hono-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =============================================================================
+  # Supporting Services
+  # =============================================================================
+  
+  # MongoDB for SOVD Client data storage
+  # Stores JSON responses from SOVD devices
   mongodb:
-    image: mongo:6.0
+    image: mongo:7.0
+    container_name: hono-mongodb
     ports:
       - "27017:27017"
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=hono
-      - MONGO_INITDB_ROOT_PASSWORD=secret
-      - MONGO_INITDB_DATABASE=hono
+      MONGO_INITDB_ROOT_USERNAME: "admin"
+      MONGO_INITDB_ROOT_PASSWORD: "password"
+      MONGO_INITDB_DATABASE: "sovd_data"
     volumes:
-      - mongodb_data:/data/db
-      - ./config/mongodb:/docker-entrypoint-initdb.d:ro
+      - mongodb-data:/data/db
+      - "./config/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro"
     networks:
       - hono-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # Device Registry Service
-  device-registry:
-    image: eclipse/hono-service-device-registry-mongodb:2.6.0
-    ports:
-      - "28080:8080"  # HTTP API
-      - "28443:8443"  # HTTPS API
-    environment:
-      - HONO_REGISTRY_AMQP_BIND_ADDRESS=0.0.0.0
-      - HONO_REGISTRY_HTTP_BIND_ADDRESS=0.0.0.0
-      - HONO_MONGODB_HOST=mongodb
-      - HONO_MONGODB_PORT=27017
-      - HONO_MONGODB_DB_NAME=hono
-      - HONO_MONGODB_USERNAME=hono
-      - HONO_MONGODB_PASSWORD=secret
+  # =============================================================================
+  # Custom Application Services
+  # =============================================================================
+  
+  # SOVD Server (Device Endpoint)
+  # Simulates vehicle diagnostic system
+  # Connects to HONO HTTP adapter as a device
+  sovd-server:
+    build:
+      context: ./python-apps/sovd-server
+      dockerfile: Dockerfile
+    container_name: sovd-server
     depends_on:
+      - hono-adapter-http
+    environment:
+      # HONO connection configuration
+      HONO_HTTP_ADAPTER_HOST: "hono-adapter-http"
+      HONO_HTTP_ADAPTER_PORT: "8080"
+      
+      # Device identification
+      HONO_TENANT_ID: "default"
+      HONO_DEVICE_ID: "vehicle-001"
+      
+      # Application configuration
+      SOVD_SERVER_PORT: "9090"
+      SOVD_LOG_LEVEL: "INFO"
+      
+      # Diagnostic data simulation
+      SOVD_SIMULATION_ENABLED: "true"
+      SOVD_SIMULATION_INTERVAL: "30"  # seconds
+      
+    ports:
+      - "9090:9090"  # SOVD server internal port
+    networks:
+      - hono-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # SOVD Client (Business Application)
+  # Connects to HONO to communicate with SOVD devices
+  # Stores diagnostic data in MongoDB
+  sovd-client:
+    build:
+      context: ./python-apps/sovd-client
+      dockerfile: Dockerfile
+    container_name: sovd-client
+    depends_on:
+      - hono-adapter-http
       - mongodb
-      - dispatch-router
-    volumes:
-      - ./config/device-registry:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
-    networks:
-      - hono-network
-
-  # Auth Server
-  auth-server:
-    image: eclipse/hono-service-auth:2.6.0
-    ports:
-      - "25671:5671"
-      - "25672:5672"
+      - kafka
     environment:
-      - HONO_AUTH_AMQP_BIND_ADDRESS=0.0.0.0
-      - HONO_AUTH_SVC_PERMISSIONS_PATH=/opt/hono/config/permissions.json
-    volumes:
-      - ./config/auth-server:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
-    depends_on:
-      - dispatch-router
-    networks:
-      - hono-network
-
-  # HTTP Protocol Adapter
-  adapter-http:
-    image: eclipse/hono-adapter-http:2.6.0
+      # HONO connection configuration
+      HONO_HTTP_ADAPTER_HOST: "hono-adapter-http"
+      HONO_HTTP_ADAPTER_PORT: "8080"
+      
+      # Target device configuration
+      HONO_TENANT_ID: "default"
+      HONO_DEVICE_ID: "vehicle-001"
+      
+      # Kafka configuration for IDS SOC event streaming
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      KAFKA_TOPIC_TELEMETRY: "hono.telemetry.default"
+      KAFKA_TOPIC_EVENTS: "hono.events.default"
+      KAFKA_TOPIC_COMMANDS: "hono.commands.default"
+      KAFKA_CONSUMER_GROUP: "sovd-client-group"
+      
+      # MongoDB configuration
+      MONGODB_HOST: "mongodb"
+      MONGODB_PORT: "27017"
+      MONGODB_USERNAME: "admin"
+      MONGODB_PASSWORD: "password"
+      MONGODB_DATABASE: "sovd_data"
+      
+      # Application configuration
+      SOVD_CLIENT_PORT: "8090"
+      SOVD_LOG_LEVEL: "INFO"
+      
+      # Polling configuration
+      SOVD_POLL_INTERVAL: "60"  # seconds
+      
     ports:
-      - "18080:8080"  # HTTP
-      - "18443:8443"  # HTTPS
-    environment:
-      - HONO_HTTP_BIND_ADDRESS=0.0.0.0
-      - HONO_HTTP_REGISTRY_HOST=device-registry
-      - HONO_HTTP_REGISTRY_PORT=5672
-      - HONO_HTTP_MESSAGING_HOST=dispatch-router
-      - HONO_HTTP_MESSAGING_PORT=5672
-      - HONO_HTTP_TENANT_API_HOST=device-registry
-      - HONO_HTTP_TENANT_API_PORT=5672
-    depends_on:
-      - device-registry
-      - auth-server
-      - dispatch-router
-    volumes:
-      - ./config/http-adapter:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
+      - "8090:8090"  # SOVD client web interface
     networks:
       - hono-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # Command Router Service (required in Hono 2.6.0)
-  command-router:
-    image: eclipse/hono-service-command-router:2.6.0
+  # Device Registration UI
+  # Web interface for registering new devices
+  # Connects to HONO Device Registry API
+  device-registration-ui:
+    build:
+      context: ./python-apps/registration-ui
+      dockerfile: Dockerfile
+    container_name: device-registration-ui
+    depends_on:
+      - hono-device-registry
+    environment:
+      # HONO Device Registry connection
+      HONO_REGISTRY_HOST: "hono-device-registry"
+      HONO_REGISTRY_PORT: "8080"
+      
+      # UI configuration
+      UI_PORT: "3000"
+      UI_LOG_LEVEL: "INFO"
+      
+      # Default tenant configuration
+      DEFAULT_TENANT_ID: "default"
+      
     ports:
-      - "26671:5671"
-      - "26672:5672"
-    environment:
-      - HONO_COMMANDROUTER_AMQP_BIND_ADDRESS=0.0.0.0
-      - HONO_COMMANDROUTER_MESSAGING_HOST=dispatch-router
-      - HONO_COMMANDROUTER_MESSAGING_PORT=5672
-    depends_on:
-      - dispatch-router
-      - auth-server
-    volumes:
-      - ./config/command-router:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
+      - "3000:3000"  # Registration UI web interface
     networks:
       - hono-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # MQTT Protocol Adapter
-  adapter-mqtt:
-    image: eclipse/hono-adapter-mqtt:2.6.0
-    ports:
-      - "1883:1883"   # MQTT
-      - "8883:8883"   # MQTTS
-    environment:
-      - HONO_MQTT_BIND_ADDRESS=0.0.0.0
-      - HONO_MQTT_REGISTRY_HOST=device-registry
-      - HONO_MQTT_REGISTRY_PORT=5672
-      - HONO_MQTT_MESSAGING_HOST=dispatch-router
-      - HONO_MQTT_MESSAGING_PORT=5672
-      - HONO_MQTT_TENANT_API_HOST=device-registry
-      - HONO_MQTT_TENANT_API_PORT=5672
-    depends_on:
-      - device-registry
-      - auth-server
-      - dispatch-router
-    volumes:
-      - ./config/mqtt-adapter:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
-    networks:
-      - hono-network
-
-volumes:
-  mongodb_data:
+# =============================================================================
+# Network and Volume Configuration
+# =============================================================================
 
 networks:
   hono-network:
     driver: bridge
-```
+    name: hono-network
 
-### Step 2: Configuration Files
+volumes:
+  # HONO Device Registry persistent storage
+  hono-device-registry-data:
+    driver: local
+    
+  # MongoDB persistent storage
+  mongodb-data:
+    driver: local
+    
+  # Kafka persistent storage
+  kafka-data:
+    driver: local
+    
+  # Zookeeper persistent storage  
+  zookeeper-data:
+    driver: local
+    
+  zookeeper-logs:
+    driver: local
 
-Create the configuration directory structure:
-
-```bash
-mkdir -p config/{dispatch,device-registry,auth-server,http-adapter,mqtt-adapter,command-router,mongodb}
-mkdir -p certs
-```
-
-#### Device Registry Configuration
-```yaml
-# config/device-registry/application.yml
-server:
-  port: 8080
-
-hono:
-  app:
-    maxInstances: 1
-  registry:
-    amqp:
-      bindAddress: "0.0.0.0"
-      port: 5672
-    http:
-      bindAddress: "0.0.0.0"
-      port: 8080
-    svc:
-      mongodb:
-        host: "mongodb"
-        port: 27017
-        dbName: "hono"
-        username: "hono"
-        password: "secret"
-  tenant:
-    service:
-      tenants:
-        - tenant-id: "hono-soc-tenant"
-          enabled: true
-          defaults:
-            ttl: 3600
-          adapters:
-            - type: "http"
-              enabled: true
-              device-authentication-required: true
-            - type: "mqtt"
-              enabled: true
-              device-authentication-required: true
-```
-
-#### Auth Server Configuration
-```json
-// config/auth-server/permissions.json
-{
-  "roles": {
-    "protocol-adapter": [
-      "registration/*:*",
-      "credentials/*:*",
-      "tenant/*:*"
-    ],
-    "consumer": [
-      "telemetry/*:*",
-      "event/*:*",
-      "command_response/*:*"
-    ],
-    "application": [
-      "command/*:*"
-    ]
-  },
-  "users": {
-    "http-adapter@HONO": {
-      "mechanism": "PLAIN",
-      "password": "http-secret",
-      "authorities": ["protocol-adapter"]
-    },
-    "mqtt-adapter@HONO": {
-      "mechanism": "PLAIN", 
-      "password": "mqtt-secret",
-      "authorities": ["protocol-adapter"]
-    },
-    "consumer@HONO": {
-      "mechanism": "PLAIN",
-      "password": "consumer-secret", 
-      "authorities": ["consumer"]
-    }
-  }
-}
-```
-
-#### Dispatch Router Configuration
-```
-# config/dispatch/qdrouterd.conf
-router {
-    mode: standalone
-    id: Hono.Example.Router
-    workerThreads: 4
-}
-
-listener {
-    host: 0.0.0.0
-    port: 5672
-    authenticatePeer: no
-    saslMechanisms: ANONYMOUS
-}
-
-listener {
-    host: 0.0.0.0
-    port: 5671
-    authenticatePeer: yes
-    requireSsl: yes
-    sslProfile: external
-    saslMechanisms: PLAIN
-}
-
-sslProfile {
-    name: external
-    certFile: /opt/hono/certs/cert.pem
-    keyFile: /opt/hono/certs/key.pem
-    caCertFile: /opt/hono/certs/ca-cert.pem
-}
-
-address {
-    prefix: telemetry/
-    distribution: balanced
-}
-
-address {
-    prefix: event/
-    distribution: balanced
-}
-
-address {
-    prefix: command/
-    distribution: balanced
-}
-```
-
-### Step 3: Certificate Generation
-
-Create a script to generate development certificates:
-
-```bash
-#!/bin/bash
-# scripts/generate-certs.sh
-
-CERT_DIR="./certs"
-mkdir -p $CERT_DIR
-
-# Generate CA key and certificate
-openssl genrsa -out $CERT_DIR/ca-key.pem 4096
-openssl req -new -x509 -key $CERT_DIR/ca-key.pem -out $CERT_DIR/ca-cert.pem -days 365 \
-    -subj "/C=US/ST=CA/L=San Francisco/O=HONO-SOC/CN=HONO-SOC-CA"
-
-# Generate server key and certificate
-openssl genrsa -out $CERT_DIR/key.pem 4096
-openssl req -new -key $CERT_DIR/key.pem -out $CERT_DIR/cert.csr \
-    -subj "/C=US/ST=CA/L=San Francisco/O=HONO-SOC/CN=hono-server"
-openssl x509 -req -in $CERT_DIR/cert.csr -CA $CERT_DIR/ca-cert.pem -CAkey $CERT_DIR/ca-key.pem \
-    -CAcreateserial -out $CERT_DIR/cert.pem -days 365
-
-# Generate client certificates for testing
-openssl genrsa -out $CERT_DIR/client-key.pem 4096
-openssl req -new -key $CERT_DIR/client-key.pem -out $CERT_DIR/client.csr \
-    -subj "/C=US/ST=CA/L=San Francisco/O=HONO-SOC/CN=test-client"
-openssl x509 -req -in $CERT_DIR/client.csr -CA $CERT_DIR/ca-cert.pem -CAkey $CERT_DIR/ca-key.pem \
-    -CAcreateserial -out $CERT_DIR/client-cert.pem -days 365
-
-# Clean up CSR files
-rm $CERT_DIR/*.csr
-
-echo "Certificates generated in $CERT_DIR"
-```
-
-### Step 4: Deployment Scripts
-
-```bash
-#!/bin/bash
-# scripts/deploy.sh
-
-echo "Starting HONO-SOC Module 3 deployment..."
-
-# Generate certificates if they don't exist
-if [ ! -f "./certs/ca-cert.pem" ]; then
-    echo "Generating certificates..."
-    ./scripts/generate-certs.sh
-fi
-
-# Start the stack
-echo "Starting Hono services..."
-docker-compose up -d
-
-# Wait for services to be ready
-echo "Waiting for services to start..."
-sleep 30
-
-# Health check
-echo "Performing health checks..."
-curl -f http://localhost:28080/health || echo "Device Registry health check failed"
-curl -f http://localhost:18080/health || echo "HTTP Adapter health check failed"
-
-echo "Deployment complete!"
-echo "Device Registry: http://localhost:28080"
-echo "HTTP Adapter: http://localhost:18080"
-echo "MQTT Adapter: mqtt://localhost:1883"
-```
-
-### Step 5: Device Registration Script
-
-```bash
-#!/bin/bash
-# scripts/register-device.sh
-
-TENANT_ID="hono-soc-tenant"
-DEVICE_ID="sovd-server-001"
-DEVICE_PASSWORD="sovd-secret"
-
-echo "Registering device $DEVICE_ID in tenant $TENANT_ID..."
-
-# Register device
-curl -X POST http://localhost:28080/v1/devices/$TENANT_ID \
-  -H "Content-Type: application/json" \
-  -d "{\"device-id\": \"$DEVICE_ID\", \"enabled\": true}"
-
-# Set device credentials
-curl -X PUT http://localhost:28080/v1/credentials/$TENANT_ID/$DEVICE_ID \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"type\": \"hashed-password\",
-    \"auth-id\": \"$DEVICE_ID\",
-    \"secrets\": [{
-      \"pwd-plain\": \"$DEVICE_PASSWORD\"
-    }]
-  }"
-
-echo "Device registered successfully!"
-```
-
-### Step 6: Testing and Validation
-
-```bash
-#!/bin/bash
-# scripts/test-deployment.sh
-
-echo "Testing HONO-SOC Module 3 deployment..."
-
-# Test 1: Device Registry API
-echo "Testing Device Registry API..."
-curl -f http://localhost:28080/v1/tenants/hono-soc-tenant
-
-# Test 2: HTTP Adapter
-echo "Testing HTTP Adapter..."
-curl -f http://localhost:18080/health
-
-# Test 3: MQTT Adapter connectivity
-echo "Testing MQTT Adapter..."
-mosquitto_pub -h localhost -p 1883 -t "telemetry/hono-soc-tenant/sovd-server-001" \
-  -u "sovd-server-001@hono-soc-tenant" -P "sovd-secret" \
-  -m '{"temp": 23.5, "humidity": 60}' || echo "MQTT test failed"
-
-echo "All tests completed!"
-```
-
-## Verification Checklist
-
-- [x] All containers start successfully
-- [ ] Device Registry responds on port 28080
-- [ ] HTTP Adapter responds on port 18080
-- [ ] MQTT Adapter accepts connections on port 1883
-- [ ] MongoDB is accessible and initialized
-- [ ] Test tenant "hono-soc-tenant" exists
-- [ ] Test device can be registered
-- [ ] SSL certificates are properly configured
-- [ ] Health endpoints return 200 OK
-
-## Next Steps
-
-After successful deployment:
-1. Configure additional tenants as needed
-2. Set up monitoring with Prometheus/Grafana
-3. Implement backup procedures for MongoDB
-4. Prepare for Module 5 (Custom HTTP Proxy Adapter) integration
-5. Document API endpoints and authentication methods
-
-## Troubleshooting
-
-### Common Issues
-- **Port conflicts**: Ensure all ports are available
-- **Certificate errors**: Regenerate certificates if expired
-- **MongoDB connection**: Check MongoDB credentials and network connectivity
-- **Memory issues**: Increase Docker memory limits for development
-
-### Useful Commands
-```bash
-# View logs
-docker-compose logs -f [service-name]
-
-# Restart specific service
-docker-compose restart [service-name]
-
-# Clean restart
-docker-compose down && docker-compose up -d
-
-# Check service health
-docker-compose ps
-```
+# =============================================================================
+# Configuration Notes
+# =============================================================================
+#
+# 1. All services run in insecure mode (no TLS/authentication)
+# 2. Default tenant "default" is used for all devices
+# 3. Device Registry API available at http://localhost:28080
+# 4. HTTP Adapter available at http://localhost:8080
+# 5. Kafka available at localhost:9092
+# 6. Registration UI available at http://localhost:3000
+# 7. SOVD Client UI available at http://localhost:8090
+# 8. MongoDB available at localhost:27017
+#
+# Kafka Topics (auto-created):
+# - hono.telemetry.default (device telemetry data)
+# - hono.events.default (device events)
+# - hono.commands.default (device commands)
+#
+# To start the stack:
+#   docker-compose up -d
+#
+# To view logs:
+#   docker-compose logs -f [service-name]
+#
+# To stop the stack:
+#   docker-compose down
+#
+# To rebuild custom applications:
+#   docker-compose build [service-name]
+#   docker-compose up -d [service-name]
+#
+# =============================================================================
