@@ -1,161 +1,255 @@
+# Required Configuration Files:
+# - ./config/permissions.json - Auth server permissions (minimal)
+# - ./config/mongo-init.js - MongoDB initialization for HONO user
+# HONO IDS SOC Docker Compose Configuration
+# Minimal HONO 2.6 stack for bridging SOVD Client and Server
+# Based on requirements: Keep HONO stack minimal - implement only required components
+# No authentication required, insecure ports and protocols only
+
+version: '3.8'
 
 services:
-  # Message Router - Using Apache Qpid Dispatch Router directly
-  dispatch-router:
-    image: quay.io/interconnectedcloud/qdrouterd:latest
+  # =============================================================================
+  # HONO Core Services - Minimal Stack as per requirements
+  # =============================================================================
+  
+  # Device Registry Service with MongoDB backend
+  # - HONO standard implementation with MongoDB storage
+  # - Allow unauthenticated devices
+  # - Implement UI to register devices using UI/manual entry
+  hono-device-registry:
+    image: eclipse/hono-service-device-registry-mongodb:2.6.0
+    container_name: hono-device-registry
+    depends_on:
+      - mongodb
+      - kafka
     ports:
-      - "15671:5671"  # AMQPS
-      - "15672:5672"  # AMQP
-    volumes:
-      - ./config/dispatch:/etc/qpid-dispatch:ro
+      - "28080:8080"  # HTTP Management API for device registration
+    environment:
+      # Basic service configuration - insecure mode
+      HONO_REGISTRY_SVC_BIND_ADDRESS: "0.0.0.0"
+      HONO_REGISTRY_SVC_INSECURE_PORT: "5671"
+      HONO_REGISTRY_SVC_INSECURE_PORT_ENABLED: "true"
+      
+      # HTTP endpoint for device registration UI
+      HONO_REGISTRY_HTTP_BIND_ADDRESS: "0.0.0.0"
+      HONO_REGISTRY_HTTP_PORT: "8080"
+      HONO_REGISTRY_HTTP_INSECURE_PORT_ENABLED: "true"
+      
+      # MongoDB connection configuration
+      HONO_REGISTRY_MONGODB_HOST: "mongodb"
+      HONO_REGISTRY_MONGODB_PORT: "27017"
+      HONO_REGISTRY_MONGODB_DB_NAME: "hono-device-registry"
+      HONO_REGISTRY_MONGODB_USERNAME: "hono"
+      HONO_REGISTRY_MONGODB_PASSWORD: "honopass"
+      
+      # Kafka messaging configuration - REQUIRED for notifications
+      HONO_MESSAGING_TYPE: "kafka"
+      HONO_MESSAGING_HOST: "kafka"
+      HONO_MESSAGING_PORT: "29092"
+      HONO_MESSAGING_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      
+      # Disable authentication as per requirements
+      HONO_REGISTRY_SVC_AUTH_VALIDATION_SHARED_SECRET: "dummy"
+      
+      # Enable auto-provisioning for ease of use
+      HONO_REGISTRY_SVC_RECEIVER_LINK_CREDIT: "100"
+      
+      # Logging
+      HONO_LOG_LEVEL: "INFO"
+      
     networks:
       - hono-network
+    restart: unless-stopped
 
-  # MongoDB for Device Registry
+  # HTTP Adapter 
+  # - HONO standard implementation
+  # - Allow unauthenticated devices only
+  # - Primary component for HTTP Command and Control API
+  hono-adapter-http:
+    image: eclipse/hono-adapter-http:2.6.0
+    container_name: hono-adapter-http
+    depends_on:
+      - hono-device-registry
+      - kafka
+    ports:
+      - "8080:8080"   # HTTP port for SOVD device communication
+    environment:
+      # HTTP adapter configuration - insecure mode only
+      HONO_HTTP_BIND_ADDRESS: "0.0.0.0"
+      HONO_HTTP_PORT: "8080"
+      HONO_HTTP_INSECURE_PORT_ENABLED: "true"
+      
+      # Disable authentication as per requirements
+      HONO_HTTP_AUTHENTICATION_REQUIRED: "false"
+      HONO_HTTP_TENANT_IDLE_TIMEOUT: "0s"
+      
+      # Device registry connection
+      HONO_REGISTRY_HOST: "hono-device-registry"
+      HONO_REGISTRY_PORT: "5671"
+      HONO_REGISTRY_USERNAME: "consumer@HONO"
+      HONO_REGISTRY_PASSWORD: "verysecret"
+      
+      # Kafka messaging configuration - REQUIRED
+      HONO_MESSAGING_TYPE: "kafka"
+      HONO_MESSAGING_HOST: "kafka"
+      HONO_MESSAGING_PORT: "29092"
+      HONO_MESSAGING_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      
+      # Command Router connection - REQUIRED
+      HONO_COMMAND_ROUTER_TYPE: "kafka"
+      HONO_COMMAND_ROUTER_HOST: "kafka"
+      HONO_COMMAND_ROUTER_PORT: "29092"
+      HONO_COMMAND_ROUTER_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      
+      # Logging
+      HONO_LOG_LEVEL: "INFO"
+      
+    networks:
+      - hono-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # MongoDB - Required for HONO Device Registry
+  # =============================================================================
+  
+  # MongoDB 6.0.24
+  # Required backend storage for HONO Device Registry
   mongodb:
-    image: docker.io/mongo:6.0.24
+    image: mongo:6.0.24
+    container_name: hono-mongodb
     ports:
       - "27017:27017"
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=hono
-      - MONGO_INITDB_ROOT_PASSWORD=secret
-      - MONGO_INITDB_DATABASE=hono
+      # MongoDB configuration
+      MONGO_INITDB_ROOT_USERNAME: "admin"
+      MONGO_INITDB_ROOT_PASSWORD: "password"
+      MONGO_INITDB_DATABASE: "hono-device-registry"
     volumes:
-      - mongodb_data:/data/db
-      - ./config/mongodb:/docker-entrypoint-initdb.d:ro
+      - mongodb-data:/data/db
+      - ./config/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
     networks:
       - hono-network
+    restart: unless-stopped
 
-  # Device Registry Service
-  device-registry:
-    image: docker.io/eclipse/hono-service-device-registry-mongodb:2.6.0
-    ports:
-      - "28080:8080"  # HTTP API
-      - "28443:8443"  # HTTPS API
-    environment:
-      - HONO_REGISTRY_AMQP_BIND_ADDRESS=0.0.0.0
-      - HONO_REGISTRY_HTTP_BIND_ADDRESS=0.0.0.0
-      - HONO_MONGODB_HOST=mongodb
-      - HONO_MONGODB_PORT=27017
-      - HONO_MONGODB_DB_NAME=hono
-      - HONO_MONGODB_USERNAME=hono
-      - HONO_MONGODB_PASSWORD=secret
-      # Replace the MongoDB env vars with:
-      - HONO_MONGODB_CONNECTION_STRING=mongodb://hono:secret@mongodb:27017/hono
+  # =============================================================================
+  # Message Broker - Kafka as specified in requirements
+  # =============================================================================
+  
+  # Apache Kafka Message Broker
+  # Required for HONO messaging between adapters and business applications
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: hono-kafka
     depends_on:
-      - mongodb
-      - dispatch-router
-    volumes:
-      - ./config/device-registry/application.yaml:/opt/hono/config/application.yaml:ro
-      - ./certs:/opt/hono/certs:ro
-    networks:
-      - hono-network
-
-  # Auth Server
-  auth-server:
-    image: docker.io/eclipse/hono-service-auth:2.6.0
+      - zookeeper
     ports:
-      - "25671:5671"
-      - "25672:5672"
+      - "9092:9092"   # Kafka broker port for external access
     environment:
-    # Add to auth-server service environment:
-      - HONO_AUTH_SVC_PERMISSIONS_PATH=/opt/hono/config/permissions.json
-      - HONO_AUTH_AMQP_BIND_ADDRESS=0.0.0.0
-      #- HONO_AUTH_MESSAGING_HOST=dispatch-router
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      
+      # Fixed listener configuration
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:29092,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      
+      # Topic auto-creation for HONO
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      
+      # Performance settings
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+      
+      # Fix for single-node setup
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      
     volumes:
-      - ./config/auth-server/permissions:/opt/hono/config/permissions:ro
-      - ./certs:/opt/hono/certs:ro
-    depends_on:
-      - dispatch-router
+      - kafka-data:/var/lib/kafka/data
     networks:
       - hono-network
+    restart: unless-stopped
 
-  # HTTP Protocol Adapter
-  adapter-http:
-    image: docker.io/eclipse/hono-adapter-http:2.6.0
+  # Apache Zookeeper
+  # Required for Kafka coordination
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: hono-zookeeper
     ports:
-      - "18080:8080"  # HTTP
-      - "18443:8443"  # HTTPS
+      - "2181:2181"
     environment:
-      - HONO_HTTP_BIND_ADDRESS=0.0.0.0
-      - HONO_HTTP_REGISTRY_HOST=device-registry
-      - HONO_HTTP_REGISTRY_PORT=5672
-      - HONO_HTTP_MESSAGING_HOST=dispatch-router
-      - HONO_HTTP_MESSAGING_PORT=5672
-      - HONO_HTTP_TENANT_API_HOST=device-registry
-      - HONO_HTTP_TENANT_API_PORT=5672
-      - HONO_MESSAGING_TYPE=amqp
-      - HONO_MESSAGING_HOST=dispatch-router
-      - HONO_MESSAGING_PORT=5672
-      - HONO_MESSAGING_USERNAME=consumer@HONO
-      - HONO_MESSAGING_PASSWORD=consumer-secret
-    depends_on:
-      - device-registry
-      - auth-server
-      - dispatch-router
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
     volumes:
-      - ./config/http-adapter:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
     networks:
       - hono-network
+    restart: unless-stopped
 
-  # Command Router Service (required in Hono 2.6.0)
-  command-router:
-    image: docker.io/eclipse/hono-service-command-router:2.6.0
-    ports:
-      - "26671:5671"
-      - "26672:5672"
-    environment:
-      - HONO_COMMANDROUTER_AMQP_BIND_ADDRESS=0.0.0.0
-      - HONO_COMMANDROUTER_MESSAGING_HOST=dispatch-router
-      - HONO_COMMANDROUTER_MESSAGING_PORT=5672
-      - HONO_MESSAGING_TYPE=amqp
-      - HONO_MESSAGING_HOST=dispatch-router
-      - HONO_MESSAGING_PORT=5672
-      - HONO_MESSAGING_USERNAME=consumer@HONO
-      - HONO_MESSAGING_PASSWORD=consumer-secret
-    depends_on:
-      - dispatch-router
-      - auth-server
-    volumes:
-      - ./config/command-router:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
-    networks:
-      - hono-network
-
-  # MQTT Protocol Adapter
-  adapter-mqtt:
-    image: docker.io/eclipse/hono-adapter-mqtt:2.6.0
-    ports:
-      - "1883:1883"   # MQTT
-      - "8883:8883"   # MQTTS
-    environment:
-      - HONO_MQTT_BIND_ADDRESS=0.0.0.0
-      - HONO_MQTT_REGISTRY_HOST=device-registry
-      - HONO_MQTT_REGISTRY_PORT=5672
-      - HONO_MQTT_MESSAGING_HOST=dispatch-router
-      - HONO_MQTT_MESSAGING_PORT=5672
-      - HONO_MQTT_TENANT_API_HOST=device-registry
-      - HONO_MQTT_TENANT_API_PORT=5672
-      # Add to command-router, http-adapter, mqtt-adapter:
-      - HONO_MESSAGING_TYPE=amqp
-      - HONO_MESSAGING_HOST=dispatch-router
-      - HONO_MESSAGING_PORT=5672
-      - HONO_MESSAGING_USERNAME=consumer@HONO
-      - HONO_MESSAGING_PASSWORD=consumer-secret
-    depends_on:
-      - device-registry
-      - auth-server
-      - dispatch-router
-    volumes:
-      - ./config/mqtt-adapter:/opt/hono/config:ro
-      - ./certs:/opt/hono/certs:ro
-    networks:
-      - hono-network
-
-volumes:
-  mongodb_data:
+  # =============================================================================
+  # Network and Volume Configuration
+  # =============================================================================
 
 networks:
   hono-network:
     driver: bridge
+    name: hono-network
+
+volumes:
+  # HONO Device Registry data (no longer needed with MongoDB)
+  # device-registry-data:
+  #   driver: local
+  
+  # MongoDB data (for HONO Device Registry)
+  mongodb-data:
+    driver: local
+    
+  # Kafka data
+  kafka-data:
+    driver: local
+    
+  # Zookeeper data
+  zookeeper-data:
+    driver: local
+    
+  zookeeper-logs:
+    driver: local
+
+# =============================================================================
+# Usage Instructions
+# =============================================================================
+#
+# This configuration implements the minimal HONO stack as per requirements:
+# 1. Device Registry - for device registration and management
+# 2. HTTP Adapter - for HTTP Command and Control API
+# 3. Kafka - for message brokering between components
+# 4. Auth Server - if required (minimal implementation)
+#
+# Key Access Points:
+# - Device Registry API: http://localhost:28080
+# - HTTP Adapter (for SOVD devices): http://localhost:8080  
+# - Kafka: localhost:9092
+# - MongoDB: localhost:27017 (for HONO Device Registry)
+# - Zookeeper: localhost:2181
+#
+# To start HONO stack:
+#   docker-compose up -d
+#
+# To register a device (manual):
+#   curl -X POST http://localhost:28080/v1/devices/default/device-001 \
+#        -H "Content-Type: application/json" \
+#        -d '{"device-id": "device-001"}'
+#
+# To send HTTP command to device:
+#   curl -X POST http://localhost:8080/telemetry/default/device-001 \
+#        -H "Content-Type: application/json" \
+#        -d '{"temp": 25, "status": "ok"}'
+#
+# =============================================================================
